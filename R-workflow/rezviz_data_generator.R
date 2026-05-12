@@ -199,6 +199,14 @@ locations <- locations_sf |>
     data_type = `Storage.Data.Type`  # "Storage" or "Elevation"
   )
 
+# RISE parameter ID (from the new column in locations.csv/geojson); fall back to
+# NA if the geojson was generated before the column was added.
+if ("RISE.Parameter.ID.for.Storage.Data" %in% names(locations_sf)) {
+  locations$rise_param_id <- locations_sf$`RISE.Parameter.ID.for.Storage.Data`
+} else {
+  locations$rise_param_id <- NA_character_
+}
+
 message(sprintf("Loaded %d locations from geojson", nrow(locations)))
 
 ################################################################################
@@ -353,75 +361,100 @@ if (nrow(new_locations) > 0) {
     hist_data <- NULL
 
     if (src_type == "rise") {
-      # RISE: fetch full range via WWDH API (CoverageJSON)
-      # No parameter-name filter (API rejects it as of April 2026) — filter in response
-      url <- paste0(
-        WWDH_API_BASE,
-        "/collections/rise-edr/locations/", loc_id,
-        "?limit=50000",
-        "&datetime=", BASELINE_START, "/", BACKFILL_END + 1,
-        "&f=json"
-      )
+      # RISE: fetch full range via WWDH API (CoverageJSON) in 5-year chunks.
+      # A single 1990->today request times out on the WWDH endpoint for
+      # long-record reservoirs, so we paginate and concatenate responses.
+      # The endpoint also now requires parameter-name=<id> (the API returns
+      # HTTP 500 without it); the id comes from the RISE Parameter ID column.
+      pid <- if (is.na(loc$rise_param_id)) "" else trimws(as.character(loc$rise_param_id))
+      if (pid == "" || toupper(pid) == "TBD") {
+        message(sprintf("    Skipping RISE backfill: no parameter id for location %s", loc_id))
+        next
+      }
 
-      tryCatch({
-        response <- request(url) |>
-          req_timeout(300) |>
-          req_retry(max_tries = 3, backoff = ~ 10) |>
-          req_perform()
+      chunk_starts <- seq(BASELINE_START, BACKFILL_END, by = "5 years")
+      all_rows <- list()
+      raw_unit <- "af"
+      unit_found <- FALSE
 
-        if (resp_status(response) == 200) {
-          body <- resp_body_json(response)
-          coverages <- body$coverages
-          if (!is.null(coverages) && length(coverages) > 0) {
-            # Find storage parameter key from response
-            storage_key <- NULL
-            bp <- body$parameters
-            if (!is.null(bp)) {
-              for (pk in names(bp)) {
-                label <- tryCatch(bp[[pk]]$observedProperty$label$en, error = function(e) "")
-                if (!is.null(label) && grepl("Storage", label, ignore.case = TRUE) &&
-                    !grepl("Change In Storage|Bank Storage", label, ignore.case = TRUE)) {
-                  storage_key <- pk
-                  break
+      for (ci in seq_along(chunk_starts)) {
+        cs <- chunk_starts[ci]
+        ce <- min(cs + years(5), BACKFILL_END + 1)
+        url <- paste0(
+          WWDH_API_BASE,
+          "/collections/rise-edr/locations/", loc_id,
+          "?parameter-name=", pid,
+          "&limit=50000",
+          "&datetime=", cs, "/", ce,
+          "&f=json"
+        )
+
+        tryCatch({
+          response <- request(url) |>
+            req_timeout(300) |>
+            req_retry(max_tries = 5, backoff = ~ 5,
+                      is_transient = ~ resp_status(.x) %in% c(408, 425, 429, 500, 502, 503, 504)) |>
+            req_perform()
+
+          if (resp_status(response) == 200) {
+            body <- resp_body_json(response)
+            coverages <- body$coverages
+            if (!is.null(coverages) && length(coverages) > 0) {
+              # Find storage parameter key from response
+              storage_key <- NULL
+              bp <- body$parameters
+              if (!is.null(bp)) {
+                for (pk in names(bp)) {
+                  label <- tryCatch(bp[[pk]]$observedProperty$label$en, error = function(e) "")
+                  if (!is.null(label) && grepl("Storage", label, ignore.case = TRUE) &&
+                      !grepl("Change In Storage|Bank Storage", label, ignore.case = TRUE)) {
+                    storage_key <- pk
+                    break
+                  }
                 }
               }
-            }
-            if (is.null(storage_key)) storage_key <- "3"
+              if (is.null(storage_key)) storage_key <- "3"
 
-            all_rows <- list()
-            for (cov in coverages) {
-              if (!is.null(cov$isModeled) && isTRUE(cov$isModeled)) next
-              t_vals <- cov$domain$axes$t$values
-              ranges <- cov$ranges
-              if (is.null(t_vals) || length(t_vals) == 0 || is.null(ranges) || length(ranges) == 0) next
-              if (!storage_key %in% names(ranges)) next
-              raw_values <- ranges[[storage_key]]$values
-              if (is.null(raw_values) || length(raw_values) == 0) next
-              for (j in seq_along(raw_values)) {
-                if (!is.null(raw_values[[j]])) {
-                  all_rows[[length(all_rows) + 1]] <- list(
-                    date  = as.Date(substr(t_vals[[j]], 1, 10)),
-                    value = as.numeric(raw_values[[j]])
-                  )
+              if (!unit_found) {
+                raw_unit <- tryCatch({
+                  u <- body$parameters[[storage_key]]$unit$symbol
+                  if (is.null(u)) "af" else u
+                }, error = function(e) "af")
+                unit_found <- TRUE
+              }
+
+              for (cov in coverages) {
+                if (!is.null(cov$isModeled) && isTRUE(cov$isModeled)) next
+                t_vals <- cov$domain$axes$t$values
+                ranges <- cov$ranges
+                if (is.null(t_vals) || length(t_vals) == 0 || is.null(ranges) || length(ranges) == 0) next
+                if (!storage_key %in% names(ranges)) next
+                raw_values <- ranges[[storage_key]]$values
+                if (is.null(raw_values) || length(raw_values) == 0) next
+                for (j in seq_along(raw_values)) {
+                  if (!is.null(raw_values[[j]])) {
+                    all_rows[[length(all_rows) + 1]] <- list(
+                      date  = as.Date(substr(t_vals[[j]], 1, 10)),
+                      value = as.numeric(raw_values[[j]])
+                    )
+                  }
                 }
               }
-            }
-            if (length(all_rows) > 0) {
-              raw_unit <- tryCatch({
-                u <- body$parameters[[storage_key]]$unit$symbol
-                if (is.null(u)) "af" else u
-              }, error = function(e) "af")
-
-              hist_data <- bind_rows(all_rows) |>
-                mutate(location_id = loc_id, unit = raw_unit) |>
-                filter(!is.na(value)) |>
-                distinct(date, .keep_all = TRUE)
             }
           }
-        }
-      }, error = function(e) {
-        message(sprintf("    Error fetching RISE historical: %s", conditionMessage(e)))
-      })
+        }, error = function(e) {
+          message(sprintf("    Error fetching RISE chunk %s..%s: %s", cs, ce, conditionMessage(e)))
+        })
+
+        Sys.sleep(0.5)
+      }
+
+      if (length(all_rows) > 0) {
+        hist_data <- bind_rows(all_rows) |>
+          mutate(location_id = loc_id, unit = raw_unit) |>
+          filter(!is.na(value)) |>
+          distinct(date, .keep_all = TRUE)
+      }
 
     } else if (src_type == "usace_cda") {
       # USACE: parse provider/ts_name and fetch
@@ -746,7 +779,7 @@ message(sprintf("  %d locations will have NA for historical metrics",
 #' @param data_type "Storage" or "Elevation" - if Elevation, converts to storage using curve
 #' Returns tibble(date, value, unit, url) with all available daily values in range
 fetch_rise <- function(location_id, target_date, lookback_days = LOOKBACK_DAYS,
-                       data_type = "Storage") {
+                       data_type = "Storage", rise_param_id = NA_character_) {
   # Query the entire lookback window at once (not day-by-day).
   # The WWDH API returns empty results for single-day queries on recent dates
   # but returns data correctly when queried as a date range.
@@ -755,23 +788,32 @@ fetch_rise <- function(location_id, target_date, lookback_days = LOOKBACK_DAYS,
   start_date <- target_date - lookback_days
   end_date   <- target_date + sample(30:90, 1)
 
-  # No parameter-name filter: the API rejects "parameter-name=Storage" as of April 2026.
-  # Instead, fetch all parameters and filter for Storage (param "3") in the response.
+  empty <- tibble(date = as.Date(character(0)), value = numeric(0),
+                  unit = character(0), url = character(0))
+
+  # The WWDH endpoint now requires parameter-name=<numeric id> (e.g. "3" for
+  # storage). Without it the server returns HTTP 500. The id comes from the
+  # "RISE Parameter ID for Storage Data" column in locations.csv.
+  # If unknown ("TBD" / empty / NA), skip this location entirely.
+  pid <- if (is.na(rise_param_id)) "" else trimws(as.character(rise_param_id))
+  if (pid == "" || toupper(pid) == "TBD") {
+    return(empty)
+  }
+
   url <- paste0(
     WWDH_API_BASE,
     "/collections/rise-edr/locations/", location_id,
-    "?limit=50",
+    "?parameter-name=", pid,
+    "&limit=50",
     "&datetime=", start_date, "/", end_date,
     "&f=json"
   )
 
-  empty <- tibble(date = as.Date(character(0)), value = numeric(0),
-                  unit = character(0), url = character(0))
-
   tryCatch({
     response <- request(url) |>
       req_timeout(60) |>
-      req_retry(max_tries = 2, backoff = ~ 2) |>
+      req_retry(max_tries = 4, backoff = ~ 3,
+                is_transient = ~ resp_status(.x) %in% c(408, 425, 429, 500, 502, 503, 504)) |>
       req_perform()
 
     if (resp_status(response) != 200) return(empty)
@@ -1091,15 +1133,16 @@ fetch_cdec <- function(location_id, target_date, lookback_days = LOOKBACK_DAYS,
 #' Returns tibble(date, value, unit, url) with all available daily values in range
 fetch_all_values <- function(location_id, source_str, target_date,
                              lookback_days = LOOKBACK_DAYS,
-                             data_type = "Storage") {
+                             data_type = "Storage",
+                             rise_param_id = NA_character_) {
   src_type <- classify_source(source_str)
 
   result <- switch(src_type,
-    "rise"     = fetch_rise(location_id, target_date, lookback_days, data_type),
+    "rise"     = fetch_rise(location_id, target_date, lookback_days, data_type, rise_param_id),
     "usace_cda" = fetch_usace(location_id, target_date, lookback_days, data_type),
     "usgs"     = fetch_usgs(location_id, target_date, lookback_days, data_type),
     "cdec"     = fetch_cdec(location_id, target_date, lookback_days, data_type),
-    fetch_rise(location_id, target_date, lookback_days, data_type)
+    fetch_rise(location_id, target_date, lookback_days, data_type, rise_param_id)
   )
 
   return(result)
@@ -1145,7 +1188,8 @@ for (i in seq_len(nrow(locations))) {
 
   # Single API call returns all daily values in the lookback window
   all_vals <- fetch_all_values(location_id, source_str, TARGET_DATE,
-                                data_type = data_type_str)
+                                data_type = data_type_str,
+                                rise_param_id = loc$rise_param_id)
 
   if (nrow(all_vals) == 0) {
     message(sprintf("  No data found"))

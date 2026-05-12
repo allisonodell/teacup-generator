@@ -100,6 +100,21 @@ locations <- locations_raw |>
 
 message(sprintf("Loaded %d locations (excluding 'Do Not Include')", nrow(locations)))
 
+# Attach the RISE numeric parameter id (e.g. "3" for storage); the WWDH endpoint
+# now requires &parameter-name=<id>. Fall back to NA if the CSV pre-dates the
+# column, in which case RISE locations will be skipped.
+if ("RISE Parameter ID for Storage Data" %in% names(locations_raw)) {
+  locations <- locations |>
+    left_join(
+      locations_raw |>
+        transmute(name = Name,
+                  rise_param_id = `RISE Parameter ID for Storage Data`),
+      by = "name"
+    )
+} else {
+  locations$rise_param_id <- NA_character_
+}
+
 # Also load the geojson to get Identifier values and authoritative source
 # classification for non-RISE sources. The geojson Identifier is the key used
 # by the USACE/USGS/CDEC lookup tables and the daily script.
@@ -122,9 +137,25 @@ locations_geojson <- st_read("config/locations.geojson", quiet = TRUE) |>
     )
   )
 
-# Split RISE locations (keyed by RISE Location ID from locations.csv)
+# Split RISE locations (keyed by RISE Location ID from locations.csv).
+# The WWDH endpoint now requires &parameter-name=<id>; drop locations whose
+# parameter id is unknown ("TBD") or empty — they can't be fetched.
 rise_locations <- locations |>
   filter(source_type == "RISE", !is.na(rise_location_id), rise_location_id != "--")
+
+rise_skipped <- rise_locations |>
+  filter(is.na(rise_param_id) | trimws(rise_param_id) == "" |
+         toupper(trimws(rise_param_id)) == "TBD")
+if (nrow(rise_skipped) > 0) {
+  message(sprintf("Skipping %d RISE location(s) with unknown parameter id (TBD/empty):",
+                  nrow(rise_skipped)))
+  for (j in seq_len(nrow(rise_skipped))) {
+    message(sprintf("  - %s (ID: %s)", rise_skipped$name[j], rise_skipped$rise_location_id[j]))
+  }
+}
+rise_locations <- rise_locations |>
+  filter(!is.na(rise_param_id) & trimws(rise_param_id) != "" &
+         toupper(trimws(rise_param_id)) != "TBD")
 
 # For non-RISE sources, use the geojson-based classification (more accurate
 # than the CSV, e.g. Tahoe is "TROA? USGS?" in CSV but "CDEC" in geojson).
@@ -162,92 +193,138 @@ message(sprintf("  - CDEC: %d locations", nrow(cdec_locations)))
 #'   https://api.wwdh.internetofwater.app/collections/rise-edr/locations/{location_id}
 #'     ?parameter-name=Storage&limit=9999&datetime={start}/{end}&f=csv
 #'
-fetch_rise_historical <- function(location_id, start_date = START_DATE, end_date = END_DATE, max_retries = 5) {
+fetch_rise_historical <- function(location_id, rise_param_id,
+                                  start_date = START_DATE, end_date = END_DATE,
+                                  max_retries = 5) {
 
-  # API requires day after intended end date to include the end date in results
-  api_end_date <- as.Date(end_date) + 1
+  empty_result <- tibble(date = Date(), value = numeric(), unit = character())
 
-  url <- paste0(
-    WWDH_API_BASE,
-    "/collections/rise-edr/locations/", location_id,
-    "?parameter-name=Storage",
-    "&limit=20000",
-    "&datetime=", start_date, "/", api_end_date,
-    "&f=csv"
-  )
-
-  message(sprintf("  Fetching RISE location %s...", location_id))
-
-  for (attempt in 1:max_retries) {
-    tryCatch({
-      response <- request(url) |>
-        req_timeout(300) |>
-        req_retry(max_tries = 5, backoff = ~ 5) |>
-        req_perform()
-
-      # Check HTTP status
-      status <- resp_status(response)
-      if (status != 200) {
-        warning(sprintf("HTTP %d for location %s", status, location_id))
-        return(tibble(date = Date(), value = numeric(), unit = character()))
-      }
-
-      # Parse CSV response
-      csv_content <- resp_body_string(response)
-
-      # Check if response is empty or malformed
-      if (nchar(csv_content) < 30) {
-        warning(sprintf("Empty or malformed response for location %s", location_id))
-        return(tibble(date = Date(), value = numeric(), unit = character()))
-      }
-
-      data <- read_csv(csv_content, show_col_types = FALSE)
-
-      # Verify expected columns exist
-      required_cols <- c("datetime", "value", "unit")
-      if (!all(required_cols %in% names(data))) {
-        warning(sprintf("Missing columns for location %s. Got: %s",
-                        location_id, paste(names(data), collapse = ", ")))
-        return(tibble(date = Date(), value = numeric(), unit = character()))
-      }
-
-      # Standardize column names based on actual RISE API response
-      # API returns: parameter, datetime, value, unit, x, y
-      data <- data |>
-        transmute(
-          date = as.Date(datetime),
-          value = value,
-          unit = unit
-        ) |>
-        filter(!is.na(value))
-
-      # Remove duplicate days - keep only the first instance of each day
-      rows_before <- nrow(data)
-      data <- data |>
-        arrange(date) |>
-        distinct(date, .keep_all = TRUE)
-      rows_after <- nrow(data)
-
-      if (rows_before != rows_after) {
-        message(sprintf("    Removed %d duplicate days (kept first instance)", rows_before - rows_after))
-      }
-
-      return(data)
-
-    }, error = function(e) {
-      if (attempt < max_retries) {
-        wait_time <- 10 * attempt  # 10, 20, 30, 40 seconds
-        message(sprintf("  Attempt %d failed for location %s: %s. Waiting %ds before retry...",
-                        attempt, location_id, e$message, wait_time))
-        Sys.sleep(wait_time)
-      } else {
-        warning(sprintf("Failed to fetch location %s after %d attempts: %s",
-                        location_id, max_retries, e$message))
-      }
-    })
+  # Skip if no parameter id (caller should already have filtered, but guard).
+  pid <- if (is.na(rise_param_id)) "" else trimws(as.character(rise_param_id))
+  if (pid == "" || toupper(pid) == "TBD") {
+    message(sprintf("  Skipping RISE location %s: no parameter id", location_id))
+    return(empty_result)
   }
 
-  return(tibble(date = Date(), value = numeric(), unit = character()))
+  # Fetch in 5-year chunks. A single full-range request times out on the WWDH
+  # endpoint for long-record reservoirs. The endpoint also requires
+  # &parameter-name=<id> (HTTP 500 without it) and now returns CoverageJSON
+  # only (f=csv is broken as of May 2026), so we parse the JSON response.
+  api_end_date <- as.Date(end_date) + 1
+  chunk_starts <- seq(as.Date(start_date), as.Date(end_date), by = "5 years")
+
+  message(sprintf("  Fetching RISE location %s (param=%s, %d chunks)...",
+                  location_id, pid, length(chunk_starts)))
+
+  parse_coverage_response <- function(body) {
+    coverages <- body$coverages
+    if (is.null(coverages) || length(coverages) == 0) return(NULL)
+
+    unit_val <- tryCatch({
+      u <- body$parameters[[pid]]$unit$symbol
+      if (is.null(u)) "af" else u
+    }, error = function(e) "af")
+    if (tolower(unit_val) == "ac-ft") unit_val <- "af"
+
+    rows <- list()
+    for (cov in coverages) {
+      if (!is.null(cov$isModeled) && isTRUE(cov$isModeled)) next
+      t_vals <- cov$domain$axes$t$values
+      ranges <- cov$ranges
+      if (is.null(t_vals) || length(t_vals) == 0 || is.null(ranges) || length(ranges) == 0) next
+      if (!pid %in% names(ranges)) next
+      raw_values <- ranges[[pid]]$values
+      if (is.null(raw_values) || length(raw_values) == 0) next
+      for (j in seq_along(raw_values)) {
+        if (!is.null(raw_values[[j]])) {
+          rows[[length(rows) + 1]] <- list(
+            date  = as.Date(substr(t_vals[[j]], 1, 10)),
+            value = as.numeric(raw_values[[j]]),
+            unit  = unit_val
+          )
+        }
+      }
+    }
+    if (length(rows) == 0) return(NULL)
+    bind_rows(rows)
+  }
+
+  chunk_results <- list()
+
+  for (ci in seq_along(chunk_starts)) {
+    cs <- chunk_starts[ci]
+    ce <- min(cs + years(5), api_end_date)
+    url <- paste0(
+      WWDH_API_BASE,
+      "/collections/rise-edr/locations/", location_id,
+      "?parameter-name=", pid,
+      "&limit=50000",
+      "&datetime=", cs, "/", ce,
+      "&f=json"
+    )
+
+    chunk_data <- NULL
+    for (attempt in 1:max_retries) {
+      attempt_result <- tryCatch({
+        response <- request(url) |>
+          req_timeout(300) |>
+          req_retry(max_tries = 5, backoff = ~ 5,
+                    is_transient = ~ resp_status(.x) %in% c(408, 425, 429, 500, 502, 503, 504)) |>
+          req_perform()
+
+        status <- resp_status(response)
+        if (status != 200) {
+          warning(sprintf("HTTP %d for location %s chunk %s..%s", status, location_id, cs, ce))
+          return(empty_result)
+        }
+
+        body <- resp_body_json(response)
+        parsed <- parse_coverage_response(body)
+        if (is.null(parsed)) empty_result else parsed |> filter(!is.na(value))
+
+      }, error = function(e) {
+        if (attempt < max_retries) {
+          wait_time <- 10 * attempt
+          message(sprintf("    Chunk %s..%s attempt %d failed: %s. Waiting %ds...",
+                          cs, ce, attempt, e$message, wait_time))
+          Sys.sleep(wait_time)
+          NULL
+        } else {
+          warning(sprintf("Failed chunk %s..%s for location %s after %d attempts: %s",
+                          cs, ce, location_id, max_retries, e$message))
+          empty_result
+        }
+      })
+
+      if (!is.null(attempt_result)) {
+        chunk_data <- attempt_result
+        break
+      }
+    }
+
+    if (!is.null(chunk_data) && nrow(chunk_data) > 0) {
+      chunk_results[[length(chunk_results) + 1]] <- chunk_data
+    }
+
+    Sys.sleep(0.5)
+  }
+
+  if (length(chunk_results) == 0) {
+    return(empty_result)
+  }
+
+  combined <- bind_rows(chunk_results)
+  rows_before <- nrow(combined)
+  combined <- combined |>
+    arrange(date) |>
+    distinct(date, .keep_all = TRUE)
+  rows_after <- nrow(combined)
+
+  if (rows_before != rows_after) {
+    message(sprintf("    Removed %d duplicate days (kept first instance)", rows_before - rows_after))
+  }
+
+  combined
 }
 
 #' Fetch historical storage data from USACE CDA timeseries API
@@ -573,7 +650,7 @@ for (i in seq_len(nrow(rise_locations))) {
                   i, nrow(rise_locations), location_name, location_id))
 
   # Fetch historical data
-  hist_data <- fetch_rise_historical(location_id)
+  hist_data <- fetch_rise_historical(location_id, loc$rise_param_id)
 
   if (nrow(hist_data) == 0) {
     message(sprintf("  WARNING: No data returned for %s", location_name))

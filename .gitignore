@@ -15,3 +15,4 @@ src/DroughtDataDownloaderV2/historicalData/
 release/_PROGRAM/historicalData/
 .env
 R-workflow/hydroshare/
+/.claude
