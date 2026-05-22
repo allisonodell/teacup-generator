@@ -30,6 +30,7 @@ WORKDIR /app
 
 # Copy runtime files
 COPY rezviz_data_generator.R .
+COPY helper_functions.R .
 COPY config/locations.geojson config/
 COPY config/elevation_storage_curves.csv config/
 

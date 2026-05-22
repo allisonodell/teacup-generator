@@ -6,7 +6,6 @@ data/
 .claude/
 *.html
 readme.md
-helper_functions.R
 setup_historical_baseline.R
 fetch_489_by_year.R
 process_manual_csvs.R
