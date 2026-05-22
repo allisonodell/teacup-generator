@@ -20,6 +20,9 @@ library(tidyr)
 library(stringr)
 library(jsonlite)
 
+# Shared utilities (elevation->storage curve loader + interpolator).
+source("helper_functions.R")
+
 ################################################################################
 # CONFIGURATION
 ################################################################################
@@ -115,6 +118,30 @@ if ("RISE Parameter ID for Storage Data" %in% names(locations_raw)) {
   locations$rise_param_id <- NA_character_
 }
 
+# Attach Storage Data Type ("Storage" / "Elevation") and the USGS parameter
+# code override (e.g. "00065" for Lake Tahoe gage height). Both feed
+# fetch_usgs_historical() so it knows when to convert via the elevation curve.
+if ("Storage Data Type" %in% names(locations_raw)) {
+  locations <- locations |>
+    left_join(
+      locations_raw |>
+        transmute(name = Name, data_type = `Storage Data Type`),
+      by = "name"
+    )
+} else {
+  locations$data_type <- NA_character_
+}
+if ("USGS Parameter Code" %in% names(locations_raw)) {
+  locations <- locations |>
+    left_join(
+      locations_raw |>
+        transmute(name = Name, usgs_param_code = `USGS Parameter Code`),
+      by = "name"
+    )
+} else {
+  locations$usgs_param_code <- NA_character_
+}
+
 # Also load the geojson to get Identifier values and authoritative source
 # classification for non-RISE sources. The geojson Identifier is the key used
 # by the USACE/USGS/CDEC lookup tables and the daily script.
@@ -158,12 +185,13 @@ rise_locations <- rise_locations |>
          toupper(trimws(rise_param_id)) != "TBD")
 
 # For non-RISE sources, use the geojson-based classification (more accurate
-# than the CSV, e.g. Tahoe is "TROA? USGS?" in CSV but "CDEC" in geojson).
+# than the CSV, e.g. some rows have "USGS-..." narrative strings in
+# `Source for Storage Data` while geojson cleanly classifies them).
 non_rise_geojson <- locations_geojson |>
   filter(geojson_source_type %in% c("USACE", "USGS", "CDEC")) |>
-  # Join with locations.csv to get capacity and other metadata
+  # Join with locations.csv to get capacity, data_type, and USGS param override.
   left_join(
-    locations |> select(name, decision, capacity),
+    locations |> select(name, decision, capacity, data_type, usgs_param_code),
     by = "name"
   ) |>
   # Only include locations not marked "Do Not Include" (already filtered in locations)
@@ -436,20 +464,44 @@ fetch_usace_historical <- function(location_id, start_date = START_DATE, end_dat
 #' Fetch historical daily storage data from USGS Water Data OGC API
 #'
 #' Uses the new OGC API (replaces legacy NWIS web services).
-#' Parameter code 00054 = reservoir storage (acre-feet).
 #' The API has a limit of 10,000 items per request, so we paginate by year
 #' to safely cover the full 30-year range.
 #' The location_id IS the USGS site number (from geojson Identifier).
 #'
+#' Parameter code selection:
+#'   - `param_override` (e.g. "00065" for Lake Tahoe gage height) takes
+#'     priority if set.
+#'   - Otherwise, when `data_type == "Elevation"`, use `62614` (NGVD29).
+#'   - Otherwise default to `00054` (reservoir storage in acre-feet).
+#'
+#' When `data_type == "Elevation"`, each observation is converted to storage
+#' via `elevation_to_storage()` before being returned. The unit is reported
+#' as `"af"` after conversion. Rows that fall outside the curve clamp to its
+#' endpoints; rows that produce NA (e.g. no curve loaded) are dropped.
+#'
 #' @param location_id Geojson Identifier which IS the USGS site number
+#' @param data_type "Storage" or "Elevation"
+#' @param param_override Explicit USGS parameter code, or NA for default
 #' @param start_date Start date (YYYY-MM-DD)
 #' @param end_date End date (YYYY-MM-DD)
 #' @return tibble with columns: date, value, unit
-fetch_usgs_historical <- function(location_id, start_date = START_DATE, end_date = END_DATE) {
+fetch_usgs_historical <- function(location_id, data_type = "Storage",
+                                  param_override = NA_character_,
+                                  start_date = START_DATE, end_date = END_DATE) {
   # location_id is the USGS site number directly from geojson Identifier
   site_no <- as.character(location_id)
 
-  message(sprintf("  Fetching USGS site %s...", site_no))
+  has_override <- !is.na(param_override) && nzchar(trimws(as.character(param_override)))
+  if (has_override) {
+    param_code <- trimws(as.character(param_override))
+  } else if (tolower(data_type) == "elevation") {
+    param_code <- "62614"
+  } else {
+    param_code <- "00054"
+  }
+
+  message(sprintf("  Fetching USGS site %s (param=%s, data_type=%s)...",
+                  site_no, param_code, data_type))
 
   all_data <- list()
   sd <- as.Date(start_date)
@@ -461,8 +513,8 @@ fetch_usgs_historical <- function(location_id, start_date = START_DATE, end_date
     year_end <- min(year_start + 365, ed)
 
     url <- sprintf(
-      "https://api.waterdata.usgs.gov/ogcapi/v0/collections/daily/items?f=json&monitoring_location_id=USGS-%s&parameter_code=00054&time=%s/%s&limit=500",
-      site_no, year_start, year_end
+      "https://api.waterdata.usgs.gov/ogcapi/v0/collections/daily/items?f=json&monitoring_location_id=USGS-%s&parameter_code=%s&time=%s/%s&limit=500",
+      site_no, param_code, year_start, year_end
     )
 
     tryCatch({
@@ -506,6 +558,20 @@ fetch_usgs_historical <- function(location_id, start_date = START_DATE, end_date
   result <- bind_rows(all_data) |>
     arrange(date) |>
     distinct(date, .keep_all = TRUE)
+
+  # Convert elevation/gage-height to storage via the curve when needed.
+  if (tolower(data_type) == "elevation" && nrow(result) > 0) {
+    message(sprintf("    Converting %d elevation/gage-height readings to storage...",
+                    nrow(result)))
+    result <- result |>
+      rowwise() |>
+      mutate(storage = elevation_to_storage(site_no, value)) |>
+      ungroup() |>
+      filter(!is.na(storage)) |>
+      mutate(value = storage, unit = "af") |>
+      select(date, value, unit)
+    message(sprintf("    Successfully converted %d readings", nrow(result)))
+  }
 
   return(result)
 }
@@ -715,8 +781,14 @@ for (i in seq_len(nrow(usgs_locations))) {
   message(sprintf("[%d/%d] Processing %s (ID: %s)",
                   i, nrow(usgs_locations), location_name, location_id))
 
-  # Fetch historical data via OGC API
-  hist_data <- fetch_usgs_historical(location_id)
+  # Fetch historical data via OGC API. data_type=="Elevation" + a USGS
+  # parameter override (e.g. Tahoe 00065 gage height) routes through the
+  # elevation_to_storage() curve.
+  hist_data <- fetch_usgs_historical(
+    location_id,
+    data_type      = if (!is.na(loc$data_type)) loc$data_type else "Storage",
+    param_override = loc$usgs_param_code
+  )
 
   if (nrow(hist_data) == 0) {
     message(sprintf("  WARNING: No data returned for %s", location_name))

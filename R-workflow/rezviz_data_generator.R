@@ -31,6 +31,10 @@ library(stringr)
 library(sf)
 library(jsonlite)
 
+# Shared utilities (elevation->storage curve loader + interpolator).
+# Must source AFTER libraries but BEFORE elev_curves is first needed.
+source("helper_functions.R")
+
 # Load .env file if present
 if (file.exists(".env")) {
   readRenviron(".env")
@@ -207,60 +211,29 @@ if ("RISE.Parameter.ID.for.Storage.Data" %in% names(locations_sf)) {
   locations$rise_param_id <- NA_character_
 }
 
+# USGS parameter code override (e.g. "00065" for Lake Tahoe gage height).
+# When set, fetch_usgs() uses this exact code instead of the default
+# elevation-fallback chain (62614 / 72275 / 62615) or the default storage code
+# (00054). Blank/NA -> use the existing defaults.
+if ("USGS.Parameter.Code" %in% names(locations_sf)) {
+  locations$usgs_param_code <- locations_sf$`USGS.Parameter.Code`
+} else {
+  locations$usgs_param_code <- NA_character_
+}
+
 message(sprintf("Loaded %d locations from geojson", nrow(locations)))
 
 ################################################################################
 # ELEVATION-TO-STORAGE CONVERSION
 ################################################################################
 
-# Load elevation-storage curves for locations that report elevation instead of storage
-elev_curves_file <- file.path(CONFIG_DIR, "elevation_storage_curves.csv")
-if (file.exists(elev_curves_file)) {
-  elev_curves <- read_csv(elev_curves_file, comment = "#", show_col_types = FALSE)
-  elev_curve_ids <- unique(elev_curves$location_id)
-  message(sprintf("Loaded elevation-storage curves for %d location(s): %s",
-                  length(elev_curve_ids), paste(elev_curve_ids, collapse = ", ")))
-} else {
-  elev_curves <- NULL
-  elev_curve_ids <- character(0)
-  message("No elevation-storage curves file found")
-}
-
-#' Convert elevation to storage using linear interpolation
-#'
-#' @param location_id The location identifier
-#' @param elevation_ft Water surface elevation in feet
-#' @return Storage in acre-feet, or NA if no curve available
-elevation_to_storage <- function(location_id, elevation_ft) {
-  if (is.null(elev_curves) || is.na(elevation_ft)) return(NA_real_)
-
-  loc_id <- as.character(location_id)
-  curve <- elev_curves |> filter(location_id == loc_id)
-
-  if (nrow(curve) == 0) {
-    warning(sprintf("No elevation-storage curve for location %s", loc_id))
-    return(NA_real_)
-  }
-
-  # Handle edge cases
-  if (elevation_ft <= min(curve$elevation_ft)) return(min(curve$storage_af))
-  if (elevation_ft >= max(curve$elevation_ft)) return(max(curve$storage_af))
-
-  # Linear interpolation
-  # Find the two points to interpolate between
-  curve <- curve |> arrange(elevation_ft)
-  idx_upper <- which(curve$elevation_ft >= elevation_ft)[1]
-  idx_lower <- idx_upper - 1
-
-  x1 <- curve$elevation_ft[idx_lower]
-  x2 <- curve$elevation_ft[idx_upper]
-  y1 <- curve$storage_af[idx_lower]
-  y2 <- curve$storage_af[idx_upper]
-
-  # Linear interpolation formula
-  storage <- y1 + (elevation_ft - x1) * (y2 - y1) / (x2 - x1)
-  return(storage)
-}
+# Load elevation-storage curves for locations that report elevation
+# (or gage height) instead of storage. The loader + lookup function live in
+# helper_functions.R; we expose `elev_curves` and `elev_curve_ids` here for
+# backward-compat with the missing-curves check below and historical reads.
+elev_curves_data <- load_elevation_curves(CONFIG_DIR)
+elev_curves    <- elev_curves_data$curves
+elev_curve_ids <- elev_curves_data$ids
 
 # Check for locations that need elevation conversion but lack curves
 elevation_locations <- locations |> filter(tolower(data_type) == "elevation")
@@ -512,8 +485,17 @@ if (nrow(new_locations) > 0) {
       # Handle elevation vs storage data types
       site_no <- as.character(loc_id)
 
+      # Honor per-location USGS parameter override (e.g. "00065" for Lake
+      # Tahoe gage height). When set, we skip the elevation fallback chain
+      # below and just use this exact parameter code.
+      usgs_param_override <- loc$usgs_param_code
+      has_usgs_override <- !is.na(usgs_param_override) &&
+                           nzchar(trimws(as.character(usgs_param_override)))
+
       # Select parameter code based on data type
-      if (tolower(data_type_str) == "elevation") {
+      if (has_usgs_override) {
+        param_code <- trimws(as.character(usgs_param_override))
+      } else if (tolower(data_type_str) == "elevation") {
         param_code <- "62614"  # Elevation (NGVD29)
       } else {
         param_code <- "00054"  # Storage (acre-feet)
@@ -537,7 +519,8 @@ if (nrow(new_locations) > 0) {
 
         # If elevation query returned nothing, try alternate elevation parameters
         # Priority: 72275 (USBR datum, e.g. Klamath Basin) > 62615 (NAVD88) > 62614 (NGVD29)
-        if (length(features) == 0 && tolower(data_type_str) == "elevation") {
+        # Skip the fallback chain when caller specified an explicit override.
+        if (length(features) == 0 && tolower(data_type_str) == "elevation" && !has_usgs_override) {
           for (alt_param in c("72275", "62615")) {
             message(sprintf("    Trying alternate elevation parameter %s...", alt_param))
             url <- sprintf(
@@ -981,11 +964,18 @@ fetch_usace <- function(location_id, target_date, lookback_days = LOOKBACK_DAYS,
 #' Parameter 62614 = lake/reservoir water surface elevation (ft NGVD29)
 #' Parameter 62615 = lake/reservoir water surface elevation (ft NAVD88)
 #' Parameter 72275 = lake/reservoir elevation (ft USBR datum, e.g. Klamath Basin)
-#' For elevation data, tries 62614 first, then falls back to 72275, then 62615
-#' @param data_type "Storage" or "Elevation" - if Elevation, converts to storage
+#' Parameter 00065 = gage height (ft above local gage datum, e.g. Lake Tahoe)
+#'
+#' For elevation data without a param_override, tries 62614 → 72275 → 62615.
+#' Set `param_override` to skip the chain and use a specific code (e.g. "00065"
+#' for Lake Tahoe, where gage height is the only available reading and the
+#' elevation_storage_curves.csv table is indexed by gage height).
+#'
+#' @param data_type "Storage" or "Elevation" - if Elevation, converts via curve
+#' @param param_override Explicit USGS parameter code (or NA for default)
 #' Returns tibble(date, value, unit, url) with all available daily values in range
 fetch_usgs <- function(location_id, target_date, lookback_days = LOOKBACK_DAYS,
-                       data_type = "Storage") {
+                       data_type = "Storage", param_override = NA_character_) {
   site_no <- as.character(location_id)
 
   start_date <- target_date - lookback_days
@@ -994,7 +984,10 @@ fetch_usgs <- function(location_id, target_date, lookback_days = LOOKBACK_DAYS,
   empty <- tibble(date = as.Date(character(0)), value = numeric(0),
                   unit = character(0), url = character(0))
 
-  if (tolower(data_type) == "elevation") {
+  has_override <- !is.na(param_override) && nzchar(trimws(as.character(param_override)))
+  if (has_override) {
+    param_code <- trimws(as.character(param_override))
+  } else if (tolower(data_type) == "elevation") {
     param_code <- "62614"
   } else {
     param_code <- "00054"
@@ -1015,8 +1008,9 @@ fetch_usgs <- function(location_id, target_date, lookback_days = LOOKBACK_DAYS,
     data <- jsonlite::fromJSON(body, simplifyVector = FALSE)
     features <- data$features
 
-    # If elevation query returned nothing, try alternate elevation parameters
-    if (length(features) == 0 && tolower(data_type) == "elevation") {
+    # If elevation query returned nothing, try alternate elevation parameters.
+    # Skip the fallback chain when caller specified an explicit override.
+    if (length(features) == 0 && tolower(data_type) == "elevation" && !has_override) {
       for (alt_param in c("72275", "62615")) {
         url <- sprintf(
           "https://api.waterdata.usgs.gov/ogcapi/v0/collections/daily/items?f=json&monitoring_location_id=USGS-%s&parameter_code=%s&time=%s/%s&limit=50",
@@ -1134,13 +1128,14 @@ fetch_cdec <- function(location_id, target_date, lookback_days = LOOKBACK_DAYS,
 fetch_all_values <- function(location_id, source_str, target_date,
                              lookback_days = LOOKBACK_DAYS,
                              data_type = "Storage",
-                             rise_param_id = NA_character_) {
+                             rise_param_id = NA_character_,
+                             usgs_param_code = NA_character_) {
   src_type <- classify_source(source_str)
 
   result <- switch(src_type,
     "rise"     = fetch_rise(location_id, target_date, lookback_days, data_type, rise_param_id),
     "usace_cda" = fetch_usace(location_id, target_date, lookback_days, data_type),
-    "usgs"     = fetch_usgs(location_id, target_date, lookback_days, data_type),
+    "usgs"     = fetch_usgs(location_id, target_date, lookback_days, data_type, usgs_param_code),
     "cdec"     = fetch_cdec(location_id, target_date, lookback_days, data_type),
     fetch_rise(location_id, target_date, lookback_days, data_type, rise_param_id)
   )
@@ -1189,7 +1184,8 @@ for (i in seq_len(nrow(locations))) {
   # Single API call returns all daily values in the lookback window
   all_vals <- fetch_all_values(location_id, source_str, TARGET_DATE,
                                 data_type = data_type_str,
-                                rise_param_id = loc$rise_param_id)
+                                rise_param_id = loc$rise_param_id,
+                                usgs_param_code = loc$usgs_param_code)
 
   if (nrow(all_vals) == 0) {
     message(sprintf("  No data found"))
