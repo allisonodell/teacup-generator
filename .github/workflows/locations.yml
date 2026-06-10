@@ -1,0 +1,24 @@
+name: Load Teacup Locations
+
+on:
+  push:
+    paths:
+      - 'R-workflow/config/locations.csv'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Cloud SDK
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_JSON }}
+      - name: Trigger Google Cloud load
+        run: |
+          gcloud run jobs execute \
+            ${{ secrets.GCP_JOB_NAME }} \
+            --region ${{ secrets.GCP_JOB_REGION }} \
+            --args teacup,locations,--force-clean-layer \
+            --wait
