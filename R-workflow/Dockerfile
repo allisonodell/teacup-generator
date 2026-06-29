@@ -13,6 +13,10 @@
 # Run and keep the CSV locally:
 #   docker run --env-file .env -v $(pwd)/hydroshare:/app/hydroshare rezviz 2026-01-15
 #
+# Run the monthly history backfill (sweeps every reservoir for missing data,
+# updates the parquet files on HydroShare). Override the entrypoint:
+#   docker run --entrypoint Rscript --env-file .env rezviz backfill_history.R
+#
 # Historical parquet files are downloaded from HydroShare during build.
 # If new locations are backfilled at runtime, updated parquet files are
 # uploaded to HydroShare. Rebuild the image to incorporate backfills.
@@ -30,6 +34,7 @@ WORKDIR /app
 
 # Copy runtime files
 COPY rezviz_data_generator.R .
+COPY backfill_history.R .
 COPY helper_functions.R .
 COPY config/locations.geojson config/
 COPY config/elevation_storage_curves.csv config/

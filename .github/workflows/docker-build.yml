@@ -7,6 +7,8 @@ on:
       - add-R-workflow
     paths:
       - 'R-workflow/rezviz_data_generator.R'
+      - 'R-workflow/backfill_history.R'
+      - 'R-workflow/helper_functions.R'
       - 'R-workflow/config/locations.csv'
       - 'R-workflow/config/locations.geojson'
       - 'R-workflow/output/historical_statistics.parquet'

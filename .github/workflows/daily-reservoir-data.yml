@@ -33,3 +33,18 @@ jobs:
       - name: Trigger Google Cloud load
         run: |
           gcloud run jobs execute ${{ secrets.GCP_JOB_NAME }} --region ${{ secrets.GCP_JOB_REGION }} --wait
+      - name: Clear staged backfill rows (only after a successful load)
+        env:
+          HYDROSHARE_USERNAME: ${{ secrets.HYDROSHARE_USERNAME }}
+          HYDROSHARE_PASSWORD: ${{ secrets.HYDROSHARE_PASSWORD }}
+        run: |
+          # The load step above (--wait) succeeded, so any gap-fill rows the daily
+          # run merged into today's CSV (staged by backfill_history.R as
+          # pending_backfill.parquet) are now ingested into the database. Delete the
+          # staging file so the rows are not re-merged on later runs. This runs ONLY
+          # after a successful load, so a failed load leaves the staging file for the
+          # next daily run to retry. A 404 (no staging file present) is expected on
+          # normal days and ignored.
+          curl -sS -u "$HYDROSHARE_USERNAME:$HYDROSHARE_PASSWORD" -X DELETE \
+            "https://www.hydroshare.org/hsapi/resource/22b2f10103e5426a837defc00927afbd/files/pending_backfill.parquet/" \
+            || echo "No staged backfill file to clear (or delete failed) — continuing."

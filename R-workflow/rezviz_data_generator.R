@@ -64,11 +64,14 @@ if (length(args) > 0) {
   TARGET_DATE <- Sys.Date() - 1
 }
 
-# How many days to look back if no data on target date
-LOOKBACK_DAYS <- 7
+# How many days to look back when fetching from each source. Must comfortably
+# exceed REPORT_DAYS so every report date still resolves to the most recent
+# value on or before it even when a source has a multi-day gap.
+LOOKBACK_DAYS <- 14
 
-# Number of days to include in output CSV (target date + previous days)
-REPORT_DAYS <- 3
+# Number of days to include in output CSV (target date + previous days).
+# Set to 7 so each daily run publishes the last 7 days of data.
+REPORT_DAYS <- 7
 
 # Historical statistics period
 STATS_PERIOD <- "10/1/1990 - 9/30/2020"
@@ -253,19 +256,8 @@ if (nrow(elevation_locations) > 0) {
 # SOURCE TYPE CLASSIFICATION
 ################################################################################
 
-#' Classify a location's data source type from the Source field in geojson
-#'
-#' @param source_str The "Source for Storage Data" field value
-#' @return One of: "rise", "usace_cda", "usgs", "cdec", "unknown"
-classify_source <- function(source_str) {
-  if (is.na(source_str) || source_str == "") return("unknown")
-  s <- tolower(source_str)
-  if (str_detect(s, "^rise"))                                  return("rise")
-  if (str_detect(s, "usace") || str_detect(s, "water\\.usace")) return("usace_cda")
-  if (str_detect(s, "^usgs") || str_detect(s, "waterdata\\.usgs")) return("usgs")
-  if (str_detect(s, "cdec\\.water\\.ca\\.gov"))                return("cdec")
-  return("unknown")
-}
+# classify_source() now lives in helper_functions.R so the daily script and the
+# standalone backfill routine share one implementation.
 
 # Note: All data sources now use the geojson Identifier directly:
 #   - RISE: Identifier is the RISE location ID (e.g., "7166")
@@ -306,14 +298,18 @@ if (nrow(new_locations) > 0) {
   }
   message("")
 
-  # Historical period for baseline statistics (used for percentiles).
+  # Historical period for baseline statistics (used for percentiles). The
+  # day-of-year statistics are ALWAYS computed over this 30-water-year window.
   BASELINE_START <- as.Date("1990-10-01")
   BASELINE_END   <- as.Date("2020-09-30")
 
-  # Backfill fetch range: pull every available daily observation from the
-  # baseline start through today, so the new location lands in the daily
-  # droughtData CSV with its full record (not just the 1990-2020 window).
-  # The stats computation below still filters to BASELINE_START..BASELINE_END.
+  # Backfill fetch range: pull every available daily observation from as far
+  # back as the sources provide (potentially the 19th century) through today,
+  # so the new location lands in the daily droughtData CSV with its COMPLETE
+  # record, not just the 1990-2020 window. Sources without old data simply
+  # return nothing for the early years. The stats computation below still
+  # filters to BASELINE_START..BASELINE_END regardless of how far back we fetch.
+  FETCH_START  <- as.Date("1870-01-01")
   BACKFILL_END <- Sys.Date()
 
   new_baseline_data <- list()
@@ -330,288 +326,10 @@ if (nrow(new_locations) > 0) {
     message(sprintf("[%d/%d] Backfilling %s (ID: %s) [%s]%s...",
                     i, nrow(new_locations), loc_name, loc_id, src_type, type_suffix))
 
-    # Fetch full historical range based on source type
-    hist_data <- NULL
-
-    if (src_type == "rise") {
-      # RISE: fetch full range via WWDH API (CoverageJSON) in 5-year chunks.
-      # A single 1990->today request times out on the WWDH endpoint for
-      # long-record reservoirs, so we paginate and concatenate responses.
-      # The endpoint also now requires parameter-name=<id> (the API returns
-      # HTTP 500 without it); the id comes from the RISE Parameter ID column.
-      pid <- if (is.na(loc$rise_param_id)) "" else trimws(as.character(loc$rise_param_id))
-      if (pid == "" || toupper(pid) == "TBD") {
-        message(sprintf("    Skipping RISE backfill: no parameter id for location %s", loc_id))
-        next
-      }
-
-      chunk_starts <- seq(BASELINE_START, BACKFILL_END, by = "5 years")
-      all_rows <- list()
-      raw_unit <- "af"
-      unit_found <- FALSE
-
-      for (ci in seq_along(chunk_starts)) {
-        cs <- chunk_starts[ci]
-        ce <- min(cs + years(5), BACKFILL_END + 1)
-        url <- paste0(
-          WWDH_API_BASE,
-          "/collections/rise-edr/locations/", loc_id,
-          "?parameter-name=", pid,
-          "&limit=50000",
-          "&datetime=", cs, "/", ce,
-          "&f=json"
-        )
-
-        tryCatch({
-          response <- request(url) |>
-            req_timeout(300) |>
-            req_retry(max_tries = 5, backoff = ~ 5,
-                      is_transient = ~ resp_status(.x) %in% c(408, 425, 429, 500, 502, 503, 504)) |>
-            req_perform()
-
-          if (resp_status(response) == 200) {
-            body <- resp_body_json(response)
-            coverages <- body$coverages
-            if (!is.null(coverages) && length(coverages) > 0) {
-              # Find storage parameter key from response
-              storage_key <- NULL
-              bp <- body$parameters
-              if (!is.null(bp)) {
-                for (pk in names(bp)) {
-                  label <- tryCatch(bp[[pk]]$observedProperty$label$en, error = function(e) "")
-                  if (!is.null(label) && grepl("Storage", label, ignore.case = TRUE) &&
-                      !grepl("Change In Storage|Bank Storage", label, ignore.case = TRUE)) {
-                    storage_key <- pk
-                    break
-                  }
-                }
-              }
-              if (is.null(storage_key)) storage_key <- "3"
-
-              if (!unit_found) {
-                raw_unit <- tryCatch({
-                  u <- body$parameters[[storage_key]]$unit$symbol
-                  if (is.null(u)) "af" else u
-                }, error = function(e) "af")
-                unit_found <- TRUE
-              }
-
-              for (cov in coverages) {
-                if (!is.null(cov$isModeled) && isTRUE(cov$isModeled)) next
-                t_vals <- cov$domain$axes$t$values
-                ranges <- cov$ranges
-                if (is.null(t_vals) || length(t_vals) == 0 || is.null(ranges) || length(ranges) == 0) next
-                if (!storage_key %in% names(ranges)) next
-                raw_values <- ranges[[storage_key]]$values
-                if (is.null(raw_values) || length(raw_values) == 0) next
-                for (j in seq_along(raw_values)) {
-                  if (!is.null(raw_values[[j]])) {
-                    all_rows[[length(all_rows) + 1]] <- list(
-                      date  = as.Date(substr(t_vals[[j]], 1, 10)),
-                      value = as.numeric(raw_values[[j]])
-                    )
-                  }
-                }
-              }
-            }
-          }
-        }, error = function(e) {
-          message(sprintf("    Error fetching RISE chunk %s..%s: %s", cs, ce, conditionMessage(e)))
-        })
-
-        Sys.sleep(0.5)
-      }
-
-      if (length(all_rows) > 0) {
-        hist_data <- bind_rows(all_rows) |>
-          mutate(location_id = loc_id, unit = raw_unit) |>
-          filter(!is.na(value)) |>
-          distinct(date, .keep_all = TRUE)
-      }
-
-    } else if (src_type == "usace_cda") {
-      # USACE: parse provider/ts_name and fetch
-      id_str <- as.character(loc_id)
-      slash_pos <- str_locate(id_str, "/")[1, "start"]
-
-      if (!is.na(slash_pos)) {
-        provider <- str_sub(id_str, 1, slash_pos - 1)
-        ts_name  <- str_sub(id_str, slash_pos + 1)
-
-        begin_str <- paste0(format(BASELINE_START, "%Y-%m-%dT00:00:00"), ".000Z")
-        end_str   <- paste0(format(BACKFILL_END + 1, "%Y-%m-%dT00:00:00"), ".000Z")
-
-        url <- sprintf(
-          "https://water.usace.army.mil/cda/reporting/providers/%s/timeseries?name=%s&begin=%s&end=%s&format=csv",
-          provider, URLencode(ts_name, reserved = TRUE), begin_str, end_str
-        )
-
-        tryCatch({
-          response <- request(url) |>
-            req_timeout(300) |>
-            req_retry(max_tries = 3, backoff = ~ 10) |>
-            req_perform()
-
-          body <- resp_body_string(response)
-          body <- str_replace_all(body, "\r", "")
-          lines <- str_split(body, "\n")[[1]]
-
-          unit_line <- lines[str_starts(lines, "##unit:")]
-          unit_val <- if (length(unit_line) > 0) trimws(str_remove(unit_line[1], "##unit:")) else "ac-ft"
-          if (tolower(unit_val) == "ac-ft") unit_val <- "af"
-
-          data_lines <- lines[!str_starts(lines, "##") & nchar(trimws(lines)) > 0]
-
-          if (length(data_lines) > 0) {
-            hist_data <- tibble(raw = data_lines) |>
-              mutate(
-                datetime = str_extract(raw, "^[^,]+"),
-                value = as.numeric(str_extract(raw, "[^,]+$")),
-                date = as.Date(str_sub(datetime, 1, 10))
-              ) |>
-              filter(!is.na(value), !is.na(date)) |>
-              group_by(date) |>
-              summarize(value = last(value), .groups = "drop") |>
-              mutate(location_id = loc_id, unit = unit_val) |>
-              select(location_id, date, value, unit)
-          }
-        }, error = function(e) {
-          message(sprintf("    Error fetching USACE historical: %s", conditionMessage(e)))
-        })
-      }
-
-    } else if (src_type == "usgs") {
-      # USGS: fetch via OGC API
-      # Handle elevation vs storage data types
-      site_no <- as.character(loc_id)
-
-      # Honor per-location USGS parameter override (e.g. "00065" for Lake
-      # Tahoe gage height). When set, we skip the elevation fallback chain
-      # below and just use this exact parameter code.
-      usgs_param_override <- loc$usgs_param_code
-      has_usgs_override <- !is.na(usgs_param_override) &&
-                           nzchar(trimws(as.character(usgs_param_override)))
-
-      # Select parameter code based on data type
-      if (has_usgs_override) {
-        param_code <- trimws(as.character(usgs_param_override))
-      } else if (tolower(data_type_str) == "elevation") {
-        param_code <- "62614"  # Elevation (NGVD29)
-      } else {
-        param_code <- "00054"  # Storage (acre-feet)
-      }
-
-      url <- sprintf(
-        "https://api.waterdata.usgs.gov/ogcapi/v0/collections/daily/items?f=json&monitoring_location_id=USGS-%s&parameter_code=%s&time=%s/%s&limit=50000",
-        site_no, param_code, BASELINE_START, BACKFILL_END
-      )
-
-      tryCatch({
-        response <- request(url) |>
-          req_timeout(300) |>
-          req_retry(max_tries = 3, backoff = ~ 10) |>
-          req_perform()
-
-        body <- resp_body_string(response)
-        data <- jsonlite::fromJSON(body, simplifyVector = FALSE)
-
-        features <- data$features
-
-        # If elevation query returned nothing, try alternate elevation parameters
-        # Priority: 72275 (USBR datum, e.g. Klamath Basin) > 62615 (NAVD88) > 62614 (NGVD29)
-        # Skip the fallback chain when caller specified an explicit override.
-        if (length(features) == 0 && tolower(data_type_str) == "elevation" && !has_usgs_override) {
-          for (alt_param in c("72275", "62615")) {
-            message(sprintf("    Trying alternate elevation parameter %s...", alt_param))
-            url <- sprintf(
-              "https://api.waterdata.usgs.gov/ogcapi/v0/collections/daily/items?f=json&monitoring_location_id=USGS-%s&parameter_code=%s&time=%s/%s&limit=50000",
-              site_no, alt_param, BASELINE_START, BACKFILL_END
-            )
-            response <- request(url) |>
-              req_timeout(300) |>
-              req_retry(max_tries = 3, backoff = ~ 10) |>
-              req_perform()
-            body <- resp_body_string(response)
-            data <- jsonlite::fromJSON(body, simplifyVector = FALSE)
-            features <- data$features
-            if (length(features) > 0) {
-              message(sprintf("    Found %d records with parameter %s", length(features), alt_param))
-              break
-            }
-          }
-        }
-
-        if (length(features) > 0) {
-          hist_data <- tibble(
-            location_id = loc_id,
-            date = as.Date(sapply(features, function(f) f$properties$time)),
-            value = as.numeric(sapply(features, function(f) f$properties$value)),
-            unit = sapply(features, function(f) f$properties$unit_of_measure)
-          ) |>
-            filter(!is.na(value)) |>
-            distinct(date, .keep_all = TRUE)
-
-          # Convert elevation to storage if needed
-          if (tolower(data_type_str) == "elevation") {
-            message(sprintf("    Converting %d elevation readings to storage...", nrow(hist_data)))
-            hist_data <- hist_data |>
-              rowwise() |>
-              mutate(
-                storage = elevation_to_storage(location_id, value)
-              ) |>
-              ungroup() |>
-              filter(!is.na(storage)) |>
-              mutate(
-                value = storage,
-                unit = "af"
-              ) |>
-              select(-storage)
-            message(sprintf("    Successfully converted %d readings", nrow(hist_data)))
-          } else {
-            hist_data <- hist_data |>
-              mutate(unit = ifelse(tolower(unit) == "acre-ft", "af", tolower(unit)))
-          }
-        }
-      }, error = function(e) {
-        message(sprintf("    Error fetching USGS historical: %s", conditionMessage(e)))
-      })
-
-    } else if (src_type == "cdec") {
-      # CDEC: fetch via CSV servlet
-      station <- as.character(loc_id)
-      url <- sprintf(
-        "https://cdec.water.ca.gov/dynamicapp/req/CSVDataServlet?Stations=%s&SensorNums=15&dur_code=D&Start=%s&End=%s",
-        station, BASELINE_START, BACKFILL_END
-      )
-
-      tryCatch({
-        response <- request(url) |>
-          req_timeout(300) |>
-          req_retry(max_tries = 3, backoff = ~ 10) |>
-          req_perform()
-
-        body <- resp_body_string(response)
-        data <- read_csv(I(body), show_col_types = FALSE,
-                         col_types = cols(`DATE TIME` = col_character(),
-                                          `OBS DATE` = col_character(),
-                                          .default = col_guess()))
-
-        if (nrow(data) > 0 && "VALUE" %in% names(data)) {
-          unit_val <- if ("UNITS" %in% names(data)) tolower(data$UNITS[1]) else "af"
-
-          hist_data <- data |>
-            mutate(
-              date = as.Date(str_sub(`DATE TIME`, 1, 8), format = "%Y%m%d"),
-              value = as.numeric(VALUE)
-            ) |>
-            filter(!is.na(value)) |>
-            transmute(location_id = loc_id, date, value, unit = unit_val) |>
-            distinct(date, .keep_all = TRUE)
-        }
-      }, error = function(e) {
-        message(sprintf("    Error fetching CDEC historical: %s", conditionMessage(e)))
-      })
-    }
+    # Fetch full historical range based on source type. The per-source logic
+    # lives in fetch_full_history() (helper_functions.R) so the daily
+    # auto-backfill and the standalone backfill_history.R routine stay in sync.
+    hist_data <- fetch_full_history(loc, FETCH_START, BACKFILL_END)
 
     if (!is.null(hist_data) && nrow(hist_data) > 0) {
       message(sprintf("    Retrieved %d historical observations", nrow(hist_data)))
@@ -657,7 +375,7 @@ if (nrow(new_locations) > 0) {
         p50  = quantile(value, 0.50, na.rm = TRUE),
         p75  = quantile(value, 0.75, na.rm = TRUE),
         p90  = quantile(value, 0.90, na.rm = TRUE),
-        n    = n(),
+        count = sum(!is.na(value)),   # canonical column name (matches calculate_daily_stats / stats parquet)
         unit = first(unit),
         .groups = "drop"
       )
@@ -681,53 +399,11 @@ if (nrow(new_locations) > 0) {
     # Generate backfill rows for new locations - to be merged into daily CSV
     message("\n=== Generating backfill rows for new locations ===\n")
 
-    # For each date in new_baseline, generate a CSV row with statistics
-    # These rows will be appended to the daily droughtData CSV (only on first detection
-    # of a new location, which is naturally the case since locations only get backfilled once).
-    backfill_rows <- new_baseline |>
-      left_join(locations, by = "location_id") |>
-      mutate(
-        data_month = month(date),
-        data_day = day(date)
-      ) |>
-      left_join(
-        new_stats |> select(location_id, month, day, min, max, p10, p25, p50, p75, p90, mean),
-        by = c("location_id", "data_month" = "month", "data_day" = "day")
-      ) |>
-      mutate(
-        pct_median  = value / p50,
-        pct_average = value / mean,
-        pct_full    = value / capacity
-      ) |>
-      transmute(
-        SiteName       = label_popup,
-        Lat            = latitude,
-        Lon            = longitude,
-        State          = state,
-        DoiRegion      = doi_region,
-        Huc6           = huc6,
-        DataUnits      = unit,
-        DataValue      = value,
-        DataDate       = format(date, "%m/%d/%Y"),
-        DateQueried    = format(Sys.Date(), "%m/%d/%Y"),
-        DataDateMax    = max,
-        DataDateP90    = p90,
-        DataDateP75    = p75,
-        DataDateP50    = p50,
-        DataDateP25    = p25,
-        DataDateP10    = p10,
-        DataDateMin    = min,
-        DataDateAvg    = mean,
-        DataValuePctMdn = pct_median,
-        DataValuePctAvg = pct_average,
-        StatsPeriod    = STATS_PERIOD,
-        MaxCapacity    = capacity,
-        ActiveCapacity = active_capacity,
-        PctFull        = pct_full,
-        TeacupUrl      = NA_character_,
-        DataUrl        = NA_character_,
-        Comment        = "backfill"
-      )
+    # For each date in new_baseline, generate a CSV row with statistics.
+    # These rows are appended to the daily droughtData CSV (only on first
+    # detection of a new location). build_drought_csv_rows() (helper_functions.R)
+    # is shared with backfill_history.R so the row layout cannot drift.
+    backfill_rows <- build_drought_csv_rows(new_baseline, locations, new_stats, STATS_PERIOD)
 
     message(sprintf("Backfill prepared: %d rows for %d new location(s) (will be merged into daily CSV)",
                     nrow(backfill_rows), n_distinct(backfill_rows$SiteName)))
@@ -1307,6 +983,33 @@ if (exists("backfill_rows") && !is.null(backfill_rows) && nrow(backfill_rows) > 
                   n_backfill, n_distinct(backfill_rows$SiteName)))
 }
 
+# Merge any pending gap-fill rows staged by the monthly backfill routine
+# (backfill_history.R). The standalone backfill cannot push to the database
+# directly — the downstream loader only ingests droughtData CSVs — so it stages
+# gap-filled observations as pending_backfill.parquet on HydroShare and the next
+# daily run rides them into the daily CSV (keyed by their real historical
+# DataDate). The staging file is deleted after a successful upload below so the
+# rows are emitted exactly once. Rows are pre-rendered in the daily CSV schema
+# by build_drought_csv_rows(), so the types align for bind_rows().
+n_pending <- 0
+pending_file <- file.path(OUTPUT_DIR, "pending_backfill.parquet")
+# Defensive: start from a clean slate so we only ever merge a freshly downloaded
+# staging file, never a leftover local copy from earlier in this run.
+if (file.exists(pending_file)) file.remove(pending_file)
+if (hs_username != "" && hs_password != "") {
+  got_pending <- download_parquet_from_hydroshare(
+    "pending_backfill.parquet", pending_file, HYDROSHARE_RESOURCE_ID, hs_username, hs_password)
+  if (got_pending && file.exists(pending_file)) {
+    pending_rows <- tryCatch(read_parquet(pending_file), error = function(e) NULL)
+    if (!is.null(pending_rows) && nrow(pending_rows) > 0) {
+      n_pending <- nrow(pending_rows)
+      output_csv <- bind_rows(output_csv, pending_rows)
+      message(sprintf("Merged %d pending gap-fill row(s) from monthly backfill into daily CSV",
+                      n_pending))
+    }
+  }
+}
+
 # Generate filename and write to hydroshare directory (git-ignored, uploaded to HS)
 output_filename <- sprintf("droughtData%s.csv", format(TARGET_DATE, "%Y%m%d"))
 if (!dir.exists(HYDROSHARE_DIR)) dir.create(HYDROSHARE_DIR, recursive = TRUE)
@@ -1387,6 +1090,15 @@ if (hs_username == "" || hs_password == "") {
   }, error = function(e) {
     message(sprintf("ERROR uploading to HydroShare: %s", e$message))
   })
+
+  # NOTE: the staged pending_backfill.parquet is NOT deleted here. These rows are
+  # only durably persisted once the downstream loader ingests this CSV, which is a
+  # SEPARATE workflow step (gcloud run jobs execute) that runs after this container
+  # exits — its success is not observable from R. Deleting here on upload-success
+  # would drop the rows permanently if that load step then failed (a later daily
+  # run would regenerate the CSV without these out-of-window historical dates).
+  # The daily workflow deletes pending_backfill.parquet only AFTER the load step
+  # succeeds; re-merging it on intervening runs is safe (idempotent insert-or-ignore).
 
   # Upload updated parquet files if backfill occurred
   # This ensures the next run starts with the latest historical data

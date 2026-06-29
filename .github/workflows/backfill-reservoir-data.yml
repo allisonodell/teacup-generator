@@ -1,0 +1,50 @@
+name: Backfill Reservoir History
+
+# Sweeps every reservoir for observations missing from the historical baseline
+# (fetching back to 1870 where sources have it), recomputes the affected
+# 1990-2020 day-of-year statistics, and uploads the refreshed baseline/statistics
+# parquet files to HydroShare. It also stages the gap-filled rows as
+# pending_backfill.parquet.
+#
+# The downstream database loader ingests ONLY droughtData CSVs, never parquet, so
+# the gap-fills reach the database via a hand-off: the next daily run downloads
+# pending_backfill.parquet, merges those rows into its droughtDataYYYYMMDD.csv
+# (keyed by their real historical DataDate), and clears the staging file. The
+# daily workflow's existing loader step then ingests them. No image rebuild and
+# no extra GCP wiring here — the daily run does the database write.
+
+on:
+  schedule:
+    # Once a month: 09:00 UTC on the 1st (≈ 2 AM Mountain Time).
+    - cron: '0 9 1 * *'
+  workflow_dispatch:  # Allow manual / on-command runs
+    inputs:
+      location_ids:
+        description: 'Optional comma-separated location_ids to restrict the sweep (blank = all reservoirs)'
+        required: false
+        default: ''
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    # Full-history fetches across ~214 reservoirs and 4 APIs take a while.
+    timeout-minutes: 720
+
+    steps:
+      - name: Run history backfill and upload updated parquet to HydroShare
+        env:
+          HYDROSHARE_USERNAME: ${{ secrets.HYDROSHARE_USERNAME }}
+          HYDROSHARE_PASSWORD: ${{ secrets.HYDROSHARE_PASSWORD }}
+          LOCATION_IDS: ${{ github.event.inputs.location_ids }}
+        run: |
+          # Create env file
+          echo "HYDROSHARE_USERNAME=$HYDROSHARE_USERNAME" > .env
+          echo "HYDROSHARE_PASSWORD=$HYDROSHARE_PASSWORD" >> .env
+
+          # Override the image entrypoint to run the backfill script. Pass the
+          # optional location_ids restriction through as a positional argument.
+          docker run --env-file .env --entrypoint Rscript \
+            ghcr.io/cgs-earth/rezviz:latest backfill_history.R "$LOCATION_IDS"
+
+          # Clean up
+          rm .env
